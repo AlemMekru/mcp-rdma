@@ -12,3 +12,10 @@ add_library(mcp_rdma STATIC
 target_include_directories(mcp_rdma PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+
+enable_testing()
+
+add_executable(test_context tests/test_context.c)
+target_link_libraries(test_context PRIVATE mcp_rdma)
+
+add_test(NAME context_test COMMAND test_context)
