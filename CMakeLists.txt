@@ -16,6 +16,7 @@ target_include_directories(mcp_rdma PUBLIC
 enable_testing()
 
 add_executable(test_context tests/test_context.c)
+target_link_libraries(mcp_rdma PUBLIC ibverbs)
 target_link_libraries(test_context PRIVATE mcp_rdma)
 
 add_test(NAME context_test COMMAND test_context)
