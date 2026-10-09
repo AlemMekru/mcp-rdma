@@ -11,6 +11,8 @@ struct mcp_rdma_context {
     struct ibv_context *device_ctx;
     struct rdma_cm_id *cm_id;
     struct rdma_event_channel *event_channel;
+    struct ibv_pd *pd;
+    struct ibv_cq *cq;
 };
 
 mcp_rdma_context *mcp_rdma_create(void) {
@@ -50,6 +52,12 @@ mcp_rdma_context *mcp_rdma_create(void) {
 
 void mcp_rdma_destroy(mcp_rdma_context *ctx) {
     if (!ctx) return;
+    if (ctx->cm_id && ctx->cm_id->qp)
+        rdma_destroy_qp(ctx->cm_id);
+    if (ctx->cq)
+        ibv_destroy_cq(ctx->cq);
+    if (ctx->pd)
+        ibv_dealloc_pd(ctx->pd);
     if (ctx->cm_id)
         rdma_destroy_id(ctx->cm_id);
     if (ctx->event_channel)
@@ -102,6 +110,30 @@ mcp_rdma_status mcp_rdma_connect(
     if (mcp_rdma_wait_for_event(
             ctx->event_channel,
             RDMA_CM_EVENT_ROUTE_RESOLVED) != 0)
+        return MCP_RDMA_ERROR;
+
+    ctx->pd = ibv_alloc_pd(ctx->cm_id->verbs);
+    if (!ctx->pd)
+        return MCP_RDMA_ERROR;
+
+    ctx->cq = ibv_create_cq(
+        ctx->cm_id->verbs, 16, NULL, NULL, 0
+    );
+
+    if (!ctx->cq)
+        return MCP_RDMA_ERROR;
+
+    struct ibv_qp_init_attr qp_attr = {0};
+
+    qp_attr.send_cq = ctx->cq;
+    qp_attr.recv_cq = ctx->cq;
+    qp_attr.qp_type = IBV_QPT_RC;
+    qp_attr.cap.max_send_wr = 16;
+    qp_attr.cap.max_recv_wr = 16;
+    qp_attr.cap.max_send_sge = 1;
+    qp_attr.cap.max_recv_sge = 1;
+
+    if (rdma_create_qp(ctx->cm_id, ctx->pd, &qp_attr) != 0)
         return MCP_RDMA_ERROR;
 
     return MCP_RDMA_OK;
