@@ -1,5 +1,6 @@
 #include "mcp_rdma.h"
 #include <stdio.h>
+#include <string.h>
 
 int main(void) {
     mcp_rdma_context *ctx = mcp_rdma_create();
@@ -30,6 +31,13 @@ int main(void) {
             message[received] = '\0';
             printf("Message %d: %s\n", i + 1, message);
             fflush(stdout);
+
+            char ack[32];
+            snprintf(ack, sizeof(ack), "ACK %d", i + 1);
+
+            status = mcp_rdma_send(ctx, ack, strlen(ack));
+            if (status != MCP_RDMA_OK)
+                break;
         }
     }
 

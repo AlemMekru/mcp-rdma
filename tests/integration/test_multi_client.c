@@ -1,7 +1,6 @@
 #include "mcp_rdma.h"
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 
 int main(int argc, char *argv[]) {
     if (argc != 2) {
@@ -33,7 +32,29 @@ int main(int argc, char *argv[]) {
             printf("Sent message %d: %s\n", i + 1, messages[i]);
             fflush(stdout);
 
-            usleep(200000);
+            char ack[32] = {0};
+            char expected[32];
+            size_t received = 0;
+
+            snprintf(expected, sizeof(expected), "ACK %d", i + 1);
+
+            status = mcp_rdma_receive(
+                ctx, ack, sizeof(ack) - 1, &received
+            );
+
+            if (status != MCP_RDMA_OK)
+                break;
+
+            ack[received] = '\0';
+
+            if (strcmp(ack, expected) != 0) {
+                fprintf(stderr, "Unexpected ACK: %s\n", ack);
+                status = MCP_RDMA_ERROR;
+                break;
+            }
+
+            printf("Received: %s\n", ack);
+            fflush(stdout);
         }
     }
 

@@ -20,6 +20,8 @@ struct mcp_rdma_context {
     struct ibv_cq *cq;
     void *buffer;
     struct ibv_mr *mr;
+    void *send_buffer;
+    struct ibv_mr *send_mr;
     size_t buffer_size;
 };
 
@@ -46,12 +48,29 @@ static int mcp_rdma_register_buffer(mcp_rdma_context *ctx) {
         return -1;
     }
 
+    ctx->send_buffer = calloc(1, ctx->buffer_size);
+    if (!ctx->send_buffer)
+        return -1;
+
+    ctx->send_mr = ibv_reg_mr(
+        ctx->pd,
+        ctx->send_buffer,
+        ctx->buffer_size,
+        0
+    );
+
+    if (!ctx->send_mr)
+        return -1;
+
     return 0;
 }
 
 static int mcp_rdma_post_receive(mcp_rdma_context *ctx) {
-    if (!ctx || !ctx->client_id || !ctx->client_id->qp ||
-        !ctx->buffer || !ctx->mr)
+    struct rdma_cm_id *id = ctx
+        ? (ctx->client_id ? ctx->client_id : ctx->cm_id)
+        : NULL;
+
+    if (!id || !id->qp || !ctx->buffer || !ctx->mr)
         return -1;
 
     struct ibv_sge sge = {0};
@@ -66,7 +85,7 @@ static int mcp_rdma_post_receive(mcp_rdma_context *ctx) {
     wr.sg_list = &sge;
     wr.num_sge = 1;
 
-    return ibv_post_recv(ctx->client_id->qp, &wr, &bad_wr);
+    return ibv_post_recv(id->qp, &wr, &bad_wr);
 }
 
 mcp_rdma_context *mcp_rdma_create(void) {
@@ -110,6 +129,9 @@ void mcp_rdma_destroy(mcp_rdma_context *ctx) {
         rdma_destroy_qp(ctx->cm_id);
     if (ctx->client_id && ctx->client_id->qp)
         rdma_destroy_qp(ctx->client_id);
+    if (ctx->send_mr)
+        ibv_dereg_mr(ctx->send_mr);
+    free(ctx->send_buffer);
     if (ctx->mr)
         ibv_dereg_mr(ctx->mr);
     free(ctx->buffer);
@@ -198,6 +220,9 @@ mcp_rdma_status mcp_rdma_connect(
         return MCP_RDMA_ERROR;
 
     if (mcp_rdma_register_buffer(ctx) != 0)
+        return MCP_RDMA_ERROR;
+
+    if (mcp_rdma_post_receive(ctx) != 0)
         return MCP_RDMA_ERROR;
 
     struct rdma_conn_param conn_param = {0};
@@ -323,7 +348,11 @@ mcp_rdma_status mcp_rdma_receive(
     size_t capacity,
     size_t *received
 ) {
-    if (!ctx || !ctx->client_id || !ctx->cq ||
+    struct rdma_cm_id *id = ctx
+        ? (ctx->client_id ? ctx->client_id : ctx->cm_id)
+        : NULL;
+
+    if (!id || !id->qp || !ctx->cq ||
         !output || !received || capacity == 0)
         return MCP_RDMA_ERROR;
 
@@ -369,17 +398,21 @@ mcp_rdma_status mcp_rdma_send(
     const void *data,
     size_t length
 ) {
-    if (!ctx || !ctx->cm_id || !ctx->cm_id->qp ||
-        !ctx->buffer || !ctx->mr || !ctx->cq ||
+    struct rdma_cm_id *id = ctx
+        ? (ctx->client_id ? ctx->client_id : ctx->cm_id)
+        : NULL;
+
+    if (!id || !id->qp ||
+        !ctx->send_buffer || !ctx->send_mr || !ctx->cq ||
         !data || length == 0 || length > ctx->buffer_size)
         return MCP_RDMA_ERROR;
 
-    memcpy(ctx->buffer, data, length);
+    memcpy(ctx->send_buffer, data, length);
 
     struct ibv_sge sge = {0};
-    sge.addr = (uintptr_t)ctx->buffer;
+    sge.addr = (uintptr_t)ctx->send_buffer;
     sge.length = (uint32_t)length;
-    sge.lkey = ctx->mr->lkey;
+    sge.lkey = ctx->send_mr->lkey;
 
     struct ibv_send_wr wr = {0};
     struct ibv_send_wr *bad_wr = NULL;
@@ -390,7 +423,7 @@ mcp_rdma_status mcp_rdma_send(
     wr.opcode = IBV_WR_SEND;
     wr.send_flags = IBV_SEND_SIGNALED;
 
-    if (ibv_post_send(ctx->cm_id->qp, &wr, &bad_wr) != 0)
+    if (ibv_post_send(id->qp, &wr, &bad_wr) != 0)
         return MCP_RDMA_ERROR;
 
     struct timespec delay = {
