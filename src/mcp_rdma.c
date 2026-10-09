@@ -1,9 +1,11 @@
 #include "mcp_rdma.h"
 #include <infiniband/verbs.h>
+#include <rdma/rdma_cma.h>
 #include <stdlib.h>
 
 struct mcp_rdma_context {
     struct ibv_context *device_ctx;
+    struct rdma_cm_id *cm_id;
 };
 
 mcp_rdma_context *mcp_rdma_create(void) {
@@ -24,11 +26,19 @@ mcp_rdma_context *mcp_rdma_create(void) {
         free(ctx);
         return NULL;
     }
+    if (rdma_create_id(NULL, &ctx->cm_id, NULL, RDMA_PS_TCP)) {
+        ibv_close_device(ctx->device_ctx);
+        free(ctx);
+        return NULL;
+    }
+
     return ctx;
 }
 
 void mcp_rdma_destroy(mcp_rdma_context *ctx) {
     if (!ctx) return;
+    if (ctx->cm_id)
+        rdma_destroy_id(ctx->cm_id);
     if (ctx->device_ctx)
         ibv_close_device(ctx->device_ctx);
     free(ctx);
