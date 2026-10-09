@@ -27,6 +27,9 @@ mcp_rdma_status mcp_rdma_disconnect(
     mcp_rdma_context *ctx
 );
 
+mcp_rdma_status mcp_rdma_listen(mcp_rdma_context *ctx, unsigned short port);
+mcp_rdma_status mcp_rdma_accept(mcp_rdma_context *ctx);
+
 #ifdef __cplusplus
 }
 #endif
