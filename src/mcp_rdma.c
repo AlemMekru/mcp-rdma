@@ -1,3 +1,6 @@
+#include <time.h>
+#include <string.h>
+#include <stdint.h>
 #include "mcp_rdma.h"
 #include <infiniband/verbs.h>
 #include <rdma/rdma_cma.h>
@@ -15,7 +18,56 @@ struct mcp_rdma_context {
     struct rdma_event_channel *event_channel;
     struct ibv_pd *pd;
     struct ibv_cq *cq;
+    void *buffer;
+    struct ibv_mr *mr;
+    size_t buffer_size;
 };
+
+static int mcp_rdma_register_buffer(mcp_rdma_context *ctx) {
+    if (!ctx || !ctx->pd || ctx->buffer || ctx->mr)
+        return -1;
+
+    ctx->buffer_size = MCP_RDMA_BUFFER_SIZE;
+    ctx->buffer = calloc(1, ctx->buffer_size);
+    if (!ctx->buffer)
+        return -1;
+
+    ctx->mr = ibv_reg_mr(
+        ctx->pd,
+        ctx->buffer,
+        ctx->buffer_size,
+        IBV_ACCESS_LOCAL_WRITE
+    );
+
+    if (!ctx->mr) {
+        free(ctx->buffer);
+        ctx->buffer = NULL;
+        ctx->buffer_size = 0;
+        return -1;
+    }
+
+    return 0;
+}
+
+static int mcp_rdma_post_receive(mcp_rdma_context *ctx) {
+    if (!ctx || !ctx->client_id || !ctx->client_id->qp ||
+        !ctx->buffer || !ctx->mr)
+        return -1;
+
+    struct ibv_sge sge = {0};
+    sge.addr = (uintptr_t)ctx->buffer;
+    sge.length = (uint32_t)ctx->buffer_size;
+    sge.lkey = ctx->mr->lkey;
+
+    struct ibv_recv_wr wr = {0};
+    struct ibv_recv_wr *bad_wr = NULL;
+
+    wr.wr_id = 1;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+
+    return ibv_post_recv(ctx->client_id->qp, &wr, &bad_wr);
+}
 
 mcp_rdma_context *mcp_rdma_create(void) {
     int count = 0;
@@ -56,15 +108,17 @@ void mcp_rdma_destroy(mcp_rdma_context *ctx) {
     if (!ctx) return;
     if (ctx->cm_id && ctx->cm_id->qp)
         rdma_destroy_qp(ctx->cm_id);
+    if (ctx->client_id && ctx->client_id->qp)
+        rdma_destroy_qp(ctx->client_id);
+    if (ctx->mr)
+        ibv_dereg_mr(ctx->mr);
+    free(ctx->buffer);
     if (ctx->cq)
         ibv_destroy_cq(ctx->cq);
     if (ctx->pd)
         ibv_dealloc_pd(ctx->pd);
-    if (ctx->client_id) {
-        if (ctx->client_id->qp)
-            rdma_destroy_qp(ctx->client_id);
+    if (ctx->client_id)
         rdma_destroy_id(ctx->client_id);
-    }
     if (ctx->cm_id)
         rdma_destroy_id(ctx->cm_id);
     if (ctx->event_channel)
@@ -141,6 +195,9 @@ mcp_rdma_status mcp_rdma_connect(
     qp_attr.cap.max_recv_sge = 1;
 
     if (rdma_create_qp(ctx->cm_id, ctx->pd, &qp_attr) != 0)
+        return MCP_RDMA_ERROR;
+
+    if (mcp_rdma_register_buffer(ctx) != 0)
         return MCP_RDMA_ERROR;
 
     struct rdma_conn_param conn_param = {0};
@@ -236,6 +293,12 @@ mcp_rdma_status mcp_rdma_accept(mcp_rdma_context *ctx) {
     if (rdma_create_qp(ctx->client_id, ctx->pd, &qp_attr) != 0)
         return MCP_RDMA_ERROR;
 
+    if (mcp_rdma_register_buffer(ctx) != 0)
+        return MCP_RDMA_ERROR;
+
+    if (mcp_rdma_post_receive(ctx) != 0)
+        return MCP_RDMA_ERROR;
+
     struct rdma_conn_param conn_param = {0};
     conn_param.responder_resources = 1;
     conn_param.initiator_depth = 1;
@@ -252,6 +315,104 @@ mcp_rdma_status mcp_rdma_accept(mcp_rdma_context *ctx) {
 
     /* RDMA connection established successfully. */
     return MCP_RDMA_OK;
+}
+
+mcp_rdma_status mcp_rdma_receive(
+    mcp_rdma_context *ctx,
+    void *output,
+    size_t capacity,
+    size_t *received
+) {
+    if (!ctx || !ctx->client_id || !ctx->cq ||
+        !output || !received || capacity == 0)
+        return MCP_RDMA_ERROR;
+
+    *received = 0;
+
+    struct timespec delay = {
+        .tv_sec = 0,
+        .tv_nsec = 1000000
+    };
+
+    for (int attempt = 0; attempt < 10000; ++attempt) {
+        struct ibv_wc wc = {0};
+        int count = ibv_poll_cq(ctx->cq, 1, &wc);
+
+        if (count < 0)
+            return MCP_RDMA_ERROR;
+
+        if (count == 1) {
+            if (wc.status != IBV_WC_SUCCESS ||
+                wc.opcode != IBV_WC_RECV ||
+                wc.wr_id != 1 ||
+                wc.byte_len > capacity)
+                return MCP_RDMA_ERROR;
+
+            memcpy(output, ctx->buffer, wc.byte_len);
+            *received = wc.byte_len;
+            return MCP_RDMA_OK;
+        }
+
+        nanosleep(&delay, NULL);
+    }
+
+    return MCP_RDMA_ERROR;
+}
+
+mcp_rdma_status mcp_rdma_send(
+    mcp_rdma_context *ctx,
+    const void *data,
+    size_t length
+) {
+    if (!ctx || !ctx->cm_id || !ctx->cm_id->qp ||
+        !ctx->buffer || !ctx->mr || !ctx->cq ||
+        !data || length == 0 || length > ctx->buffer_size)
+        return MCP_RDMA_ERROR;
+
+    memcpy(ctx->buffer, data, length);
+
+    struct ibv_sge sge = {0};
+    sge.addr = (uintptr_t)ctx->buffer;
+    sge.length = (uint32_t)length;
+    sge.lkey = ctx->mr->lkey;
+
+    struct ibv_send_wr wr = {0};
+    struct ibv_send_wr *bad_wr = NULL;
+
+    wr.wr_id = 2;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_SEND;
+    wr.send_flags = IBV_SEND_SIGNALED;
+
+    if (ibv_post_send(ctx->cm_id->qp, &wr, &bad_wr) != 0)
+        return MCP_RDMA_ERROR;
+
+    struct timespec delay = {
+        .tv_sec = 0,
+        .tv_nsec = 1000000
+    };
+
+    for (int attempt = 0; attempt < 10000; ++attempt) {
+        struct ibv_wc wc = {0};
+        int count = ibv_poll_cq(ctx->cq, 1, &wc);
+
+        if (count < 0)
+            return MCP_RDMA_ERROR;
+
+        if (count == 1) {
+            if (wc.status == IBV_WC_SUCCESS &&
+                wc.opcode == IBV_WC_SEND &&
+                wc.wr_id == 2)
+                return MCP_RDMA_OK;
+
+            return MCP_RDMA_ERROR;
+        }
+
+        nanosleep(&delay, NULL);
+    }
+
+    return MCP_RDMA_ERROR;
 }
 
 mcp_rdma_status mcp_rdma_disconnect(mcp_rdma_context *ctx) {
