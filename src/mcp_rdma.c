@@ -350,6 +350,11 @@ mcp_rdma_status mcp_rdma_receive(
 
             memcpy(output, ctx->buffer, wc.byte_len);
             *received = wc.byte_len;
+
+            /* Prepare the buffer for the next message. */
+            if (mcp_rdma_post_receive(ctx) != 0)
+                return MCP_RDMA_ERROR;
+
             return MCP_RDMA_OK;
         }
 
