@@ -20,3 +20,6 @@ target_link_libraries(mcp_rdma PUBLIC ibverbs)
 target_link_libraries(test_context PRIVATE mcp_rdma)
 
 add_test(NAME context_test COMMAND test_context)
+add_executable(test_rdma_device tests/test_rdma_device.c)
+target_link_libraries(test_rdma_device PRIVATE mcp_rdma)
+add_test(NAME rdma_device_test COMMAND test_rdma_device)
