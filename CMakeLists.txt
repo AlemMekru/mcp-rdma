@@ -16,7 +16,14 @@ target_include_directories(mcp_rdma PUBLIC
 enable_testing()
 
 add_executable(test_context tests/test_context.c)
-target_link_libraries(mcp_rdma PUBLIC ibverbs rdmacm)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(JSONC REQUIRED IMPORTED_TARGET json-c)
+
+target_link_libraries(mcp_rdma PUBLIC
+    ibverbs
+    rdmacm
+    PkgConfig::JSONC
+)
 target_link_libraries(test_context PRIVATE mcp_rdma)
 
 add_test(NAME context_test COMMAND test_context)
@@ -50,6 +57,44 @@ if(MCP_RDMA_TEST_HOST)
     )
 
     set_tests_properties(rdma_multi_message_test PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        TIMEOUT 45
+    )
+endif()
+
+
+# MCP JSON-RPC protocol handler
+target_sources(mcp_rdma PRIVATE
+    src/mcp_jsonrpc.c
+)
+
+
+# MCP JSON-RPC unit test
+add_executable(test_jsonrpc tests/test_jsonrpc.c)
+target_link_libraries(test_jsonrpc PRIVATE mcp_rdma)
+add_test(NAME jsonrpc_test COMMAND test_jsonrpc)
+
+
+# MCP JSON-RPC integration executables
+add_executable(test_mcp_server
+    tests/integration/test_mcp_server.c)
+target_link_libraries(test_mcp_server PRIVATE mcp_rdma)
+
+add_executable(test_mcp_client
+    tests/integration/test_mcp_client.c)
+target_link_libraries(test_mcp_client PRIVATE mcp_rdma)
+
+
+# MCP JSON-RPC over RDMA integration test
+if(MCP_RDMA_TEST_HOST)
+    add_test(
+        NAME mcp_jsonrpc_integration_test
+        COMMAND bash
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/run_mcp_test.sh
+            ${MCP_RDMA_TEST_HOST}
+    )
+
+    set_tests_properties(mcp_jsonrpc_integration_test PROPERTIES
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         TIMEOUT 45
     )
