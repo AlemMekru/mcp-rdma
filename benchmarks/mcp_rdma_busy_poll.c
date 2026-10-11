@@ -1,0 +1,530 @@
+#include <time.h>
+#include <string.h>
+#include <stdint.h>
+#include "mcp_rdma.h"
+#include <infiniband/verbs.h>
+#include <rdma/rdma_cma.h>
+#include <stdlib.h>
+#include <netdb.h>
+#include <stdio.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+
+struct mcp_rdma_context {
+    struct ibv_context *device_ctx;
+    struct rdma_cm_id *cm_id;
+    struct rdma_cm_id *client_id;
+    struct rdma_event_channel *event_channel;
+    struct ibv_pd *pd;
+    struct ibv_cq *cq;
+    struct ibv_cq *recv_cq;
+    void *buffer;
+    struct ibv_mr *mr;
+    void *send_buffer;
+    struct ibv_mr *send_mr;
+    size_t buffer_size;
+};
+
+static int mcp_rdma_register_buffer(mcp_rdma_context *ctx) {
+    if (!ctx || !ctx->pd || ctx->buffer || ctx->mr)
+        return -1;
+
+    ctx->buffer_size = MCP_RDMA_BUFFER_SIZE;
+    ctx->buffer = calloc(1, ctx->buffer_size);
+    if (!ctx->buffer)
+        return -1;
+
+    ctx->mr = ibv_reg_mr(
+        ctx->pd,
+        ctx->buffer,
+        ctx->buffer_size,
+        IBV_ACCESS_LOCAL_WRITE
+    );
+
+    if (!ctx->mr) {
+        free(ctx->buffer);
+        ctx->buffer = NULL;
+        ctx->buffer_size = 0;
+        return -1;
+    }
+
+    ctx->send_buffer = calloc(1, ctx->buffer_size);
+    if (!ctx->send_buffer)
+        return -1;
+
+    ctx->send_mr = ibv_reg_mr(
+        ctx->pd,
+        ctx->send_buffer,
+        ctx->buffer_size,
+        0
+    );
+
+    if (!ctx->send_mr)
+        return -1;
+
+    return 0;
+}
+
+static int mcp_rdma_post_receive(mcp_rdma_context *ctx) {
+    struct rdma_cm_id *id = ctx
+        ? (ctx->client_id ? ctx->client_id : ctx->cm_id)
+        : NULL;
+
+    if (!id || !id->qp || !ctx->buffer || !ctx->mr)
+        return -1;
+
+    struct ibv_sge sge = {0};
+    sge.addr = (uintptr_t)ctx->buffer;
+    sge.length = (uint32_t)ctx->buffer_size;
+    sge.lkey = ctx->mr->lkey;
+
+    struct ibv_recv_wr wr = {0};
+    struct ibv_recv_wr *bad_wr = NULL;
+
+    wr.wr_id = 1;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+
+    return ibv_post_recv(id->qp, &wr, &bad_wr);
+}
+
+mcp_rdma_context *mcp_rdma_create(void) {
+    int count = 0;
+    struct ibv_device **devices = ibv_get_device_list(&count);
+    if (!devices || count == 0) {
+        if (devices) ibv_free_device_list(devices);
+        return NULL;
+    }
+
+    mcp_rdma_context *ctx = calloc(1, sizeof(*ctx));
+    if (ctx)
+        ctx->device_ctx = ibv_open_device(devices[0]);
+
+    ibv_free_device_list(devices);
+
+    if (!ctx || !ctx->device_ctx) {
+        free(ctx);
+        return NULL;
+    }
+    ctx->event_channel = rdma_create_event_channel();
+    if (!ctx->event_channel) {
+        ibv_close_device(ctx->device_ctx);
+        free(ctx);
+        return NULL;
+    }
+
+    if (rdma_create_id(ctx->event_channel, &ctx->cm_id, NULL, RDMA_PS_TCP)) {
+        rdma_destroy_event_channel(ctx->event_channel);
+        ibv_close_device(ctx->device_ctx);
+        free(ctx);
+        return NULL;
+    }
+
+    return ctx;
+}
+
+void mcp_rdma_destroy(mcp_rdma_context *ctx) {
+    if (!ctx) return;
+    if (ctx->cm_id && ctx->cm_id->qp)
+        rdma_destroy_qp(ctx->cm_id);
+    if (ctx->client_id && ctx->client_id->qp)
+        rdma_destroy_qp(ctx->client_id);
+    if (ctx->send_mr)
+        ibv_dereg_mr(ctx->send_mr);
+    free(ctx->send_buffer);
+    if (ctx->mr)
+        ibv_dereg_mr(ctx->mr);
+    free(ctx->buffer);
+    if (ctx->recv_cq)
+        ibv_destroy_cq(ctx->recv_cq);
+    if (ctx->cq)
+        ibv_destroy_cq(ctx->cq);
+    if (ctx->pd)
+        ibv_dealloc_pd(ctx->pd);
+    if (ctx->client_id)
+        rdma_destroy_id(ctx->client_id);
+    if (ctx->cm_id)
+        rdma_destroy_id(ctx->cm_id);
+    if (ctx->event_channel)
+        rdma_destroy_event_channel(ctx->event_channel);
+    if (ctx->device_ctx)
+        ibv_close_device(ctx->device_ctx);
+    free(ctx);
+}
+
+static int mcp_rdma_wait_for_event(
+    struct rdma_event_channel *channel,
+    enum rdma_cm_event_type expected
+);
+
+mcp_rdma_status mcp_rdma_connect(
+    mcp_rdma_context *ctx, const char *host, unsigned short port
+) {
+    if (!ctx || !ctx->cm_id || !host || port == 0)
+        return MCP_RDMA_ERROR;
+
+    struct addrinfo hints = {0};
+    struct addrinfo *result = NULL;
+    char service[6];
+
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    snprintf(service, sizeof(service), "%hu", port);
+
+    if (getaddrinfo(host, service, &hints, &result) != 0)
+        return MCP_RDMA_ERROR;
+
+    int rc = rdma_resolve_addr(
+        ctx->cm_id, NULL, result->ai_addr, 2000
+    );
+
+    freeaddrinfo(result);
+
+    if (rc != 0)
+        return MCP_RDMA_ERROR;
+
+    if (mcp_rdma_wait_for_event(
+            ctx->event_channel,
+            RDMA_CM_EVENT_ADDR_RESOLVED) != 0)
+        return MCP_RDMA_ERROR;
+
+    if (rdma_resolve_route(ctx->cm_id, 2000) != 0)
+        return MCP_RDMA_ERROR;
+
+    if (mcp_rdma_wait_for_event(
+            ctx->event_channel,
+            RDMA_CM_EVENT_ROUTE_RESOLVED) != 0)
+        return MCP_RDMA_ERROR;
+
+    ctx->pd = ibv_alloc_pd(ctx->cm_id->verbs);
+    if (!ctx->pd)
+        return MCP_RDMA_ERROR;
+
+    ctx->cq = ibv_create_cq(
+        ctx->cm_id->verbs, 16, NULL, NULL, 0
+    );
+
+    if (!ctx->cq)
+        return MCP_RDMA_ERROR;
+
+    ctx->recv_cq = ibv_create_cq(ctx->pd->context, 16, NULL, NULL, 0);
+    if (!ctx->recv_cq) return MCP_RDMA_ERROR;
+
+    struct ibv_qp_init_attr qp_attr = {0};
+
+    qp_attr.send_cq = ctx->cq;
+    qp_attr.recv_cq = ctx->recv_cq;
+    qp_attr.qp_type = IBV_QPT_RC;
+    qp_attr.cap.max_send_wr = 16;
+    qp_attr.cap.max_recv_wr = 16;
+    qp_attr.cap.max_send_sge = 1;
+    qp_attr.cap.max_recv_sge = 1;
+
+    if (rdma_create_qp(ctx->cm_id, ctx->pd, &qp_attr) != 0)
+        return MCP_RDMA_ERROR;
+
+    if (mcp_rdma_register_buffer(ctx) != 0)
+        return MCP_RDMA_ERROR;
+
+    if (mcp_rdma_post_receive(ctx) != 0)
+        return MCP_RDMA_ERROR;
+
+    struct rdma_conn_param conn_param = {0};
+    conn_param.responder_resources = 1;
+    conn_param.initiator_depth = 1;
+    conn_param.retry_count = 7;
+    conn_param.rnr_retry_count = 7;
+
+    if (rdma_connect(ctx->cm_id, &conn_param) != 0)
+        return MCP_RDMA_ERROR;
+
+    if (mcp_rdma_wait_for_event(
+            ctx->event_channel,
+            RDMA_CM_EVENT_ESTABLISHED) != 0)
+        return MCP_RDMA_ERROR;
+
+    return MCP_RDMA_OK;
+}
+
+mcp_rdma_status mcp_rdma_listen(
+    mcp_rdma_context *ctx, unsigned short port
+) {
+    if (!ctx || !ctx->cm_id || port == 0)
+        return MCP_RDMA_ERROR;
+
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(port);
+
+    if (rdma_bind_addr(
+            ctx->cm_id, (struct sockaddr *)&addr) != 0)
+        return MCP_RDMA_ERROR;
+
+    if (rdma_listen(ctx->cm_id, 1) != 0)
+        return MCP_RDMA_ERROR;
+
+    return MCP_RDMA_OK;
+}
+
+mcp_rdma_status mcp_rdma_accept(mcp_rdma_context *ctx) {
+    if (!ctx || !ctx->event_channel || !ctx->cm_id)
+        return MCP_RDMA_ERROR;
+
+    struct pollfd fd = {
+        .fd = ctx->event_channel->fd,
+        .events = POLLIN
+    };
+
+    if (poll(&fd, 1, 30000) <= 0 ||
+        !(fd.revents & POLLIN))
+        return MCP_RDMA_ERROR;
+
+    struct rdma_cm_event *event = NULL;
+
+    if (rdma_get_cm_event(ctx->event_channel, &event) != 0)
+        return MCP_RDMA_ERROR;
+
+    if (event->event != RDMA_CM_EVENT_CONNECT_REQUEST ||
+        event->status != 0) {
+        rdma_ack_cm_event(event);
+        return MCP_RDMA_ERROR;
+    }
+
+    if (ctx->client_id) {
+        rdma_ack_cm_event(event);
+        return MCP_RDMA_ERROR;
+    }
+
+    ctx->client_id = event->id;
+    rdma_ack_cm_event(event);
+
+    ctx->pd = ibv_alloc_pd(ctx->client_id->verbs);
+    if (!ctx->pd)
+        return MCP_RDMA_ERROR;
+
+    ctx->cq = ibv_create_cq(
+        ctx->client_id->verbs, 16, NULL, NULL, 0
+    );
+    if (!ctx->cq)
+        return MCP_RDMA_ERROR;
+
+    ctx->recv_cq = ibv_create_cq(ctx->pd->context, 16, NULL, NULL, 0);
+    if (!ctx->recv_cq) return MCP_RDMA_ERROR;
+
+    struct ibv_qp_init_attr qp_attr = {0};
+
+    qp_attr.send_cq = ctx->cq;
+    qp_attr.recv_cq = ctx->recv_cq;
+    qp_attr.qp_type = IBV_QPT_RC;
+    qp_attr.cap.max_send_wr = 16;
+    qp_attr.cap.max_recv_wr = 16;
+    qp_attr.cap.max_send_sge = 1;
+    qp_attr.cap.max_recv_sge = 1;
+
+    if (rdma_create_qp(ctx->client_id, ctx->pd, &qp_attr) != 0)
+        return MCP_RDMA_ERROR;
+
+    if (mcp_rdma_register_buffer(ctx) != 0)
+        return MCP_RDMA_ERROR;
+
+    if (mcp_rdma_post_receive(ctx) != 0)
+        return MCP_RDMA_ERROR;
+
+    struct rdma_conn_param conn_param = {0};
+    conn_param.responder_resources = 1;
+    conn_param.initiator_depth = 1;
+    conn_param.retry_count = 7;
+    conn_param.rnr_retry_count = 7;
+
+    if (rdma_accept(ctx->client_id, &conn_param) != 0)
+        return MCP_RDMA_ERROR;
+
+    if (mcp_rdma_wait_for_event(
+            ctx->event_channel,
+            RDMA_CM_EVENT_ESTABLISHED) != 0)
+        return MCP_RDMA_ERROR;
+
+    /* RDMA connection established successfully. */
+    return MCP_RDMA_OK;
+}
+
+mcp_rdma_status mcp_rdma_receive(
+    mcp_rdma_context *ctx,
+    void *output,
+    size_t capacity,
+    size_t *received
+) {
+    struct rdma_cm_id *id = ctx
+        ? (ctx->client_id ? ctx->client_id : ctx->cm_id)
+        : NULL;
+
+    if (!id || !id->qp || !ctx->recv_cq ||
+        !output || !received || capacity == 0)
+        return MCP_RDMA_ERROR;
+
+    *received = 0;
+
+    struct timespec started, now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &started) != 0)
+        return MCP_RDMA_ERROR;
+
+    for (;;) {
+        struct ibv_wc wc = {0};
+        int count = ibv_poll_cq(ctx->recv_cq, 1, &wc);
+
+        if (count < 0) {
+            fprintf(stderr, "%s: CQ polling failed\n", __func__);
+            return MCP_RDMA_ERROR;
+        }
+
+        if (count == 1) {
+            if (wc.status != IBV_WC_SUCCESS ||
+                wc.opcode != IBV_WC_RECV ||
+                wc.wr_id != 1 ||
+                wc.byte_len > capacity) {
+                fprintf(stderr,
+                    "RECV completion: status=%s opcode=%d wr_id=%llu bytes=%u\n",
+                    ibv_wc_status_str(wc.status), (int)wc.opcode,
+                    (unsigned long long)wc.wr_id, wc.byte_len);
+                return MCP_RDMA_ERROR;
+            }
+
+            memcpy(output, ctx->buffer, wc.byte_len);
+            *received = wc.byte_len;
+
+            /* Prepare the buffer for the next message. */
+            if (mcp_rdma_post_receive(ctx) != 0)
+                return MCP_RDMA_ERROR;
+
+            return MCP_RDMA_OK;
+        }
+
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+            return MCP_RDMA_ERROR;
+
+        long long elapsed_ns =
+            (long long)(now.tv_sec - started.tv_sec) * 1000000000LL +
+            (now.tv_nsec - started.tv_nsec);
+
+        if (elapsed_ns >= 10000000000LL) {
+            fprintf(stderr,
+                "TIMEOUT in %s: no completion after 10 seconds\n",
+                __func__);
+            return MCP_RDMA_ERROR;
+        }
+    }
+
+    return MCP_RDMA_ERROR;
+}
+
+mcp_rdma_status mcp_rdma_send(
+    mcp_rdma_context *ctx,
+    const void *data,
+    size_t length
+) {
+    struct rdma_cm_id *id = ctx
+        ? (ctx->client_id ? ctx->client_id : ctx->cm_id)
+        : NULL;
+
+    if (!id || !id->qp ||
+        !ctx->send_buffer || !ctx->send_mr || !ctx->cq ||
+        !data || length == 0 || length > ctx->buffer_size)
+        return MCP_RDMA_ERROR;
+
+    memcpy(ctx->send_buffer, data, length);
+
+    struct ibv_sge sge = {0};
+    sge.addr = (uintptr_t)ctx->send_buffer;
+    sge.length = (uint32_t)length;
+    sge.lkey = ctx->send_mr->lkey;
+
+    struct ibv_send_wr wr = {0};
+    struct ibv_send_wr *bad_wr = NULL;
+
+    wr.wr_id = 2;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_SEND;
+    wr.send_flags = IBV_SEND_SIGNALED;
+
+    if (ibv_post_send(id->qp, &wr, &bad_wr) != 0)
+        return MCP_RDMA_ERROR;
+
+    struct timespec started, now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &started) != 0)
+        return MCP_RDMA_ERROR;
+
+    for (;;) {
+        struct ibv_wc wc = {0};
+        int count = ibv_poll_cq(ctx->cq, 1, &wc);
+
+        if (count < 0) {
+            fprintf(stderr, "%s: CQ polling failed\n", __func__);
+            return MCP_RDMA_ERROR;
+        }
+
+        if (count == 1) {
+            if (wc.status == IBV_WC_SUCCESS &&
+                wc.opcode == IBV_WC_SEND &&
+                wc.wr_id == 2)
+                return MCP_RDMA_OK;
+
+            fprintf(stderr,
+                "SEND completion: status=%s opcode=%d wr_id=%llu\n",
+                ibv_wc_status_str(wc.status), (int)wc.opcode,
+                (unsigned long long)wc.wr_id);
+            return MCP_RDMA_ERROR;
+        }
+
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+            return MCP_RDMA_ERROR;
+
+        long long elapsed_ns =
+            (long long)(now.tv_sec - started.tv_sec) * 1000000000LL +
+            (now.tv_nsec - started.tv_nsec);
+
+        if (elapsed_ns >= 10000000000LL) {
+            fprintf(stderr,
+                "TIMEOUT in %s: no completion after 10 seconds\n",
+                __func__);
+            return MCP_RDMA_ERROR;
+        }
+    }
+
+    return MCP_RDMA_ERROR;
+}
+
+mcp_rdma_status mcp_rdma_disconnect(mcp_rdma_context *ctx) {
+    if (!ctx) return MCP_RDMA_ERROR;
+    return MCP_RDMA_UNSUPPORTED;
+}
+
+static int mcp_rdma_wait_for_event(
+    struct rdma_event_channel *channel,
+    enum rdma_cm_event_type expected
+) {
+    struct pollfd fd = {
+        .fd = channel->fd,
+        .events = POLLIN
+    };
+
+    if (poll(&fd, 1, 2000) <= 0 ||
+        !(fd.revents & POLLIN))
+        return -1;
+
+    struct rdma_cm_event *event = NULL;
+
+    if (rdma_get_cm_event(channel, &event) != 0)
+        return -1;
+
+    int success = (event->event == expected &&
+                   event->status == 0);
+
+    rdma_ack_cm_event(event);
+    return success ? 0 : -1;
+}
