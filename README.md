@@ -1,6 +1,5 @@
-
 # MCP-RDMA
-### Experimental Low-Latency RDMA Transport for the Model Context Protocol
+### Accelerating AI Agent Communication with RDMA
 
 **MCP-RDMA** is an experimental C-based research project investigating the use of **Remote Direct Memory Access (RDMA)** to reduce communication latency in AI-agent systems that exchange Model Context Protocol (MCP)-style messages.
 
